@@ -1,0 +1,6 @@
+config.json
+input/
+output/
+work/
+*.log
+

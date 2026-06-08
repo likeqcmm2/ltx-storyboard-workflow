@@ -1,0 +1,15 @@
+{
+  "storyboard": "C:\\path\\to\\storyboard.xlsx",
+  "timestamps": "C:\\path\\to\\time_stamp.csv",
+  "voice_over": "C:\\path\\to\\voice_over.mp3",
+  "avatar_image": "C:\\path\\to\\avatar.jpeg",
+  "avatar_prompt": "C:\\path\\to\\Prompt_for_avatar.txt",
+  "output_dir": ".\\output",
+  "first_scene": 1,
+  "last_scene": 20,
+  "image_steps": 4,
+  "video_duration": 5,
+  "video_fps": 24,
+  "backend_port": 41955
+}
+
