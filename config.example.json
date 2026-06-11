@@ -4,12 +4,15 @@
   "voice_over": "C:\\path\\to\\voice_over.mp3",
   "avatar_image": "C:\\path\\to\\avatar.jpeg",
   "avatar_prompt": "C:\\path\\to\\Prompt_for_avatar.txt",
+  "persona_images_dir": "C:\\path\\to\\Persona_Story",
   "output_dir": ".\\output",
   "first_scene": 1,
-  "last_scene": 20,
+  "last_scene": 100,
   "image_steps": 4,
   "video_duration": 5,
   "video_fps": 24,
-  "backend_port": 41955
+  "backend_port": 41955,
+  "lipsync_python": "python",
+  "lipsync_max_attempts": 3
 }
 
