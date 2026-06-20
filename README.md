@@ -49,8 +49,12 @@ of truth is `Resources/output_scenes/scene_N.png`, including
    ffmpeg -loop 1 -i input.png -vf "scale=8000:-1,zoompan=z='zoom+0.001':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=150:s=1920x1080,format=yuv420p" -an -c:v h264_nvenc -t 5 output.mp4
    ```
 
-4. Cut voice-over by timestamp and generate Avatar clips. The default avatar
-   prompt for this workflow is:
+4. Cut voice-over by timestamp and generate Avatar clips. For lipsync
+   reliability, the avatar audio sent to LTX is prepared with a 1 second silent
+   lead-in, then boosted with `ffmpeg -i input.mp3 -filter:a "volume=20dB"
+   -q:a 0 output.mp3`. Avatar generation is at least 6 seconds, then the first
+   1 second is trimmed from the generated video before it is saved as the final
+   avatar clip. The default avatar prompt for this workflow is:
 
    ```text
    the man speaking directly to the camera, stable camera.
@@ -117,6 +121,66 @@ python3 ltx_linux_workflow.py \
 
 Existing files are skipped. Add `--force` only when intentionally regenerating
 existing media.
+
+### Generate Avatars From Timestamp Cuts
+
+Use this path when `time_stamp.csv` is a list of independent voice-over cuts
+instead of full-scene timeline boundaries. Each non-empty row that contains a
+`START - END` time range is treated as one avatar clip. The script does not read
+the storyboard or scene types.
+
+Required files:
+
+```text
+Resources/
+  time_stamp.csv
+  voice_over.mp3
+  avatar.png
+  Prompt_for_avatar.txt
+```
+
+Run with the LTX backend already open:
+
+```bash
+python3 generate_avatars_from_timestamp_cuts.py \
+  --resources /root/Resources \
+  --output-dir /root/Resources/production_output
+```
+
+The script prepares two audio versions per cut:
+
+```text
+production_output/
+  avatar-audio/scene_N.mp3      # original timestamp cut
+  avatar-audio-ltx/scene_N.mp3  # 1s silence + +20dB, used for LTX
+```
+
+The generated LTX video with the silent lead-in is kept under
+`production_output/work/avatar-videos-with-leadin` and should be about 6 seconds
+for these timestamp cuts. The final avatar clips have the first 1 second removed
+and are trimmed back to the original timestamp-cut duration, so 4-5 second final
+clips are expected when the source cuts are 4-5 seconds long.
+
+LTX Desktop local Fast currently supports 1080p audio-to-video at 5 seconds
+only. When the 1 second lead-in requires 6 second generation, the workflow
+generates the avatar at 720p/6s and then scales/crops the final trimmed clip to
+1920x1080.
+
+Outputs:
+
+```text
+production_output/
+  avatar-audio/scene_N.mp3
+  avatar-audio-ltx/scene_N.mp3
+  avatar-videos/scene_N.mp4
+  videos/scene_N.mp4
+```
+
+Rows are numbered by cut order, not by spreadsheet scene number. Existing audio
+and video files are skipped; add `--force` to regenerate them. Use
+`--first-cut` and `--last-cut` to process only part of the timestamp file.
+Use `--lead-in-seconds` and `--audio-gain-db` to adjust the lipsync workaround;
+the defaults are `1.0` and `20.0`.
 
 To regenerate avatar outputs with the stable-camera prompt, delete old avatar
 outputs and rewrite `Prompt_for_avatar.txt`:

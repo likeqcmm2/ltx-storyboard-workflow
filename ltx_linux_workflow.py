@@ -100,6 +100,31 @@ def strip_audio(ffmpeg: str, src: Path, dst: Path):
     run([ffmpeg,'-nostdin','-y','-i',str(src),'-map','0:v:0','-c:v','copy','-an',str(tmp)], f'Strip audio failed {dst}')
     tmp.replace(dst)
 
+def prepare_ltx_avatar_audio(ffmpeg: str, src: Path, dst: Path, lead_in: float, gain_db: float):
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    padded = dst.with_suffix('.padded.tmp.mp3')
+    run([
+        ffmpeg,'-nostdin','-y',
+        '-f','lavfi','-t',f'{lead_in:.3f}','-i','anullsrc=r=44100:cl=stereo',
+        '-i',str(src),
+        '-filter_complex','[0:a][1:a]concat=n=2:v=0:a=1[a]',
+        '-map','[a]','-codec:a','libmp3lame','-q:a','0',str(padded),
+    ], f'Add avatar lead-in failed {dst}')
+    run([
+        ffmpeg,'-nostdin','-y','-i',str(padded),'-filter:a',f'volume={gain_db:g}dB',
+        '-q:a','0',str(dst),
+    ], f'Boost avatar audio failed {dst}')
+    padded.unlink(missing_ok=True)
+
+def trim_avatar_leadin(ffmpeg: str, src: Path, dst: Path, lead_in: float, duration: float):
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    run([
+        ffmpeg,'-nostdin','-y','-i',str(src),'-ss',f'{lead_in:.3f}','-t',f'{duration:.3f}',
+        '-map','0:v:0','-map','0:a:0?','-c:v','libx264','-preset','veryfast','-crf','18',
+        '-vf','scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,format=yuv420p',
+        '-c:a','aac','-b:a','192k','-movflags','+faststart',str(dst),
+    ], f'Trim avatar lead-in failed {dst}')
+
 def copy_scene_images(scenes, source_dir: Path, image_dir: Path):
     image_dir.mkdir(parents=True, exist_ok=True)
     missing=[]
@@ -184,11 +209,13 @@ def main():
     ap.add_argument('--motion-speed', type=float, default=1.0, help='Slow only Motion scenes during final assembly; use 0.6 for the corrected YouTube edit.')
     ap.add_argument('--youtube-1080p', action='store_true', help='Export H.264/AAC settings suitable for YouTube 1080p.')
     ap.add_argument('--final-name', default='final_video.mp4', help='Final output filename inside output dir.')
+    ap.add_argument('--avatar-lead-in-seconds', type=float, default=1.0)
+    ap.add_argument('--avatar-audio-gain-db', type=float, default=20.0)
     args=ap.parse_args()
     res=Path(args.resources)
     out=Path(args.output_dir)
-    image_dir=out/'images'; video_dir=out/'videos'; audio_dir=out/'avatar-audio'; work_dir=out/'work'; avatar_video_dir=out/'avatar-videos'
-    for d in (out,image_dir,video_dir,audio_dir,work_dir,avatar_video_dir): d.mkdir(parents=True, exist_ok=True)
+    image_dir=out/'images'; video_dir=out/'videos'; audio_dir=out/'avatar-audio'; ltx_audio_dir=out/'avatar-audio-ltx'; work_dir=out/'work'; avatar_video_dir=out/'avatar-videos'; raw_avatar_dir=work_dir/'avatar-videos-with-leadin'
+    for d in (out,image_dir,video_dir,audio_dir,ltx_audio_dir,work_dir,avatar_video_dir,raw_avatar_dir): d.mkdir(parents=True, exist_ok=True)
     storyboard=res/'storyboard_elias_yoder.xlsx'; timestamps_path=res/'time_stamp.csv'; voice=res/'voice_over.mp3'; avatar_img=res/'avatar.png'; avatar_prompt=(res/'Prompt_for_avatar.txt').read_text(encoding='utf-8').strip()
     scenes=read_storyboard(storyboard,args.first_scene,args.last_scene)
     timestamps=read_timestamps(timestamps_path,args.first_scene,args.last_scene)
@@ -214,14 +241,19 @@ def main():
             aud=audio_dir/f'scene_{n}.mp3'
             if args.force or not aud.exists():
                 run([ffmpeg,'-nostdin','-y','-ss',f"{ts['start']:.3f}",'-t',f"{ts['duration']:.3f}",'-i',str(voice),'-vn','-codec:a','libmp3lame','-q:a','2',str(aud)], f'Audio cut failed {n}')
+            ltx_aud=ltx_audio_dir/f'scene_{n}.mp3'
+            if args.force or not ltx_aud.exists():
+                prepare_ltx_avatar_audio(ffmpeg, aud, ltx_aud, args.avatar_lead_in_seconds, args.avatar_audio_gain_db)
             dst=video_dir/(f'scene_{n}_1.mp4' if sc['type']=='Avatar/Split-screen' else f'scene_{n}.mp4')
             if dst.exists() and not args.force: print(f'SKIP AVATAR {n}', flush=True); continue
             dur=ffprobe_duration(aud)
-            # LTX local accepts literal duration set, choose nearest supported >=5; output is trimmed in final assembly.
-            gen_dur=5
-            print(f'AVATAR {n} audio={dur:.3f}s', flush=True)
-            r=api_post(args.base_url,'/api/generate',{'prompt': avatar_prompt,'resolution':'1080p','model':'fast','cameraMotion':'none','negativePrompt':'','duration':gen_dur,'fps':fps,'audio':True,'imagePath':str(avatar_img),'audioPath':str(aud),'aspectRatio':'16:9'})
-            shutil.copy2(r['video_path'], dst)
+            gen_dur=max(6, int((dur + args.avatar_lead_in_seconds) + 0.999))
+            avatar_resolution = '720p' if gen_dur > 5 else '1080p'
+            raw_dst=raw_avatar_dir/(f'scene_{n}_1.mp4' if sc['type']=='Avatar/Split-screen' else f'scene_{n}.mp4')
+            print(f'AVATAR {n} audio={dur:.3f}s ltx_audio={dur + args.avatar_lead_in_seconds:.3f}s generation_duration={gen_dur}s resolution={avatar_resolution}->1080p', flush=True)
+            r=api_post(args.base_url,'/api/generate',{'prompt': avatar_prompt,'resolution':avatar_resolution,'model':'fast','cameraMotion':'none','negativePrompt':'','duration':gen_dur,'fps':fps,'audio':True,'imagePath':str(avatar_img),'audioPath':str(ltx_aud),'aspectRatio':'16:9'})
+            shutil.copy2(r['video_path'], raw_dst)
+            trim_avatar_leadin(ffmpeg, raw_dst, dst, args.avatar_lead_in_seconds, dur)
             if sc['type']=='Avatar': shutil.copy2(dst, avatar_video_dir/dst.name)
             else: shutil.copy2(dst, avatar_video_dir/dst.name)
     # KenBurn clips: standalone and right side for split-screen.

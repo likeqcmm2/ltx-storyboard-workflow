@@ -13,6 +13,8 @@ param(
     [int[]]$PersonaKenBurnScenes = @(),
     [int[]]$PersonaSplitScenes = @(),
     [int]$BackendPort = 41955,
+    [double]$AvatarLeadInSeconds = 1.0,
+    [double]$AvatarAudioGainDb = 20.0,
     [switch]$Force,
     [switch]$SkipLipsyncCheck
 )
@@ -112,8 +114,10 @@ $outputPath = Resolve-PathValue $OutputDir
 $imageDir = Join-Path $outputPath "images"
 $videoDir = Join-Path $outputPath "videos"
 $audioDir = Join-Path $outputPath "avatar-audio"
+$ltxAudioDir = Join-Path $outputPath "avatar-audio-ltx"
 $workDir = Join-Path $outputPath "work"
-@($outputPath, $imageDir, $videoDir, $audioDir, $workDir) | ForEach-Object {
+$rawAvatarDir = Join-Path $workDir "avatar-videos-with-leadin"
+@($outputPath, $imageDir, $videoDir, $audioDir, $ltxAudioDir, $workDir, $rawAvatarDir) | ForEach-Object {
     New-Item -ItemType Directory -Path $_ -Force | Out-Null
 }
 
@@ -193,14 +197,60 @@ try {
             $duration = $timestamp.Duration.ToString("0.000", [Globalization.CultureInfo]::InvariantCulture)
             Run-Ffmpeg @("-y", "-ss", $start, "-t", $duration, "-i", $voicePath, "-vn", "-codec:a", "libmp3lame", "-q:a", "2", $audio) "Failed to cut avatar audio scene_$($scene.Scene)."
         }
+        $ltxAudio = Join-Path $ltxAudioDir "scene_$($scene.Scene).mp3"
+        if ($Force -or -not (Test-Path $ltxAudio)) {
+            $leadIn = $AvatarLeadInSeconds.ToString("0.000", [Globalization.CultureInfo]::InvariantCulture)
+            $paddedAudio = Join-Path $ltxAudioDir "scene_$($scene.Scene).padded.tmp.mp3"
+            Run-Ffmpeg @(
+                "-y",
+                "-f", "lavfi",
+                "-t", $leadIn,
+                "-i", "anullsrc=r=44100:cl=stereo",
+                "-i", $audio,
+                "-filter_complex", "[0:a][1:a]concat=n=2:v=0:a=1[a]",
+                "-map", "[a]",
+                "-codec:a", "libmp3lame",
+                "-q:a", "0",
+                $paddedAudio
+            ) "Failed to add avatar lead-in scene_$($scene.Scene)."
+            Run-Ffmpeg @(
+                "-y",
+                "-i", $paddedAudio,
+                "-filter:a", "volume=$($AvatarAudioGainDb)dB",
+                "-q:a", "0",
+                $ltxAudio
+            ) "Failed to boost LTX avatar audio scene_$($scene.Scene)."
+            Remove-Item -LiteralPath $paddedAudio -Force -ErrorAction SilentlyContinue
+        }
         if ((Test-Path $destination) -and -not $Force) { continue }
         Write-Host "AVATAR scene_$($scene.Scene) [$($scene.Type)]"
+        $generationDuration = [Math]::Max(6, [Math]::Ceiling($timestamp.Duration + $AvatarLeadInSeconds))
+        $avatarResolution = if ($generationDuration -gt 5) { "720p" } else { "1080p" }
         $result = Invoke-Ltx $baseUrl "/api/generate" @{
-            prompt = $avatarPromptText; resolution = "1080p"; model = "fast"; cameraMotion = "none"
-            negativePrompt = ""; duration = 5; fps = 24; audio = $true; imagePath = $avatarImagePath
-            audioPath = $audio; aspectRatio = "16:9"
+            prompt = $avatarPromptText; resolution = $avatarResolution; model = "fast"; cameraMotion = "none"
+            negativePrompt = ""; duration = $generationDuration; fps = 24; audio = $true; imagePath = $avatarImagePath
+            audioPath = $ltxAudio; aspectRatio = "16:9"
         }
-        Copy-Item $result.video_path $destination -Force
+        $rawDestination = Join-Path $rawAvatarDir $destinationName
+        Copy-Item $result.video_path $rawDestination -Force
+        $trimDuration = $timestamp.Duration.ToString("0.000", [Globalization.CultureInfo]::InvariantCulture)
+        $leadIn = $AvatarLeadInSeconds.ToString("0.000", [Globalization.CultureInfo]::InvariantCulture)
+        Run-Ffmpeg @(
+            "-y",
+            "-i", $rawDestination,
+            "-ss", $leadIn,
+            "-t", $trimDuration,
+            "-map", "0:v:0",
+            "-map", "0:a:0?",
+            "-vf", "scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,format=yuv420p",
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "18",
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-movflags", "+faststart",
+            $destination
+        ) "Failed to trim avatar lead-in scene_$($scene.Scene)."
     }
 }
 finally {
