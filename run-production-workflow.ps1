@@ -15,8 +15,11 @@ param(
     [int]$BackendPort = 41955,
     [double]$AvatarLeadInSeconds = 1.0,
     [double]$AvatarAudioGainDb = 20.0,
+    [double]$YoutubeMotionSpeed = 0.6,
     [switch]$Force,
-    [switch]$SkipLipsyncCheck
+    [switch]$SkipLipsyncCheck,
+    [switch]$SkipAssemble,
+    [switch]$SkipYoutubeAssemble
 )
 
 $ErrorActionPreference = "Stop"
@@ -80,8 +83,20 @@ function Start-LtxBackend([string]$Python, [string]$Backend, [string]$AppData, [
     $env:LTX_PORT = "$Port"
     $env:LTX_AUTH_TOKEN = ""
     $backendDir = Split-Path -Parent $Backend
-    $bootstrap = "import sys; sys.path.insert(0, r'$backendDir'); import runpy; runpy.run_path(r'$Backend', run_name='__main__')"
-    $process = Start-Process -FilePath $Python -ArgumentList @("-u", "-c", "`"$bootstrap`"") `
+    $bootstrapPath = Join-Path (Split-Path -Parent $Log) "ltx-backend-bootstrap.py"
+    @(
+        "import os"
+        "import runpy"
+        "import sys"
+        "backend_dir = r'$backendDir'"
+        "backend = r'$Backend'"
+        "os.environ['LTX_APP_DATA_DIR'] = r'$AppData'"
+        "os.environ['LTX_PORT'] = '$Port'"
+        "os.environ['LTX_AUTH_TOKEN'] = ''"
+        "sys.path.insert(0, backend_dir)"
+        "runpy.run_path(backend, run_name='__main__')"
+    ) | Set-Content -LiteralPath $bootstrapPath -Encoding ASCII
+    $process = Start-Process -FilePath $Python -ArgumentList @("-u", $bootstrapPath) `
         -WorkingDirectory $backendDir -RedirectStandardOutput $Log -RedirectStandardError "$Log.error" `
         -WindowStyle Hidden -PassThru
     $deadline = (Get-Date).AddMinutes(3)
@@ -103,6 +118,87 @@ function Invoke-Ltx([string]$BaseUrl, [string]$Route, [hashtable]$Body) {
 function Run-Ffmpeg([string[]]$Arguments, [string]$Failure) {
     & $script:ffmpeg @Arguments
     if ($LASTEXITCODE -ne 0) { throw $Failure }
+}
+
+function Invoke-FinalAssembly(
+    [object[]]$Scenes,
+    [hashtable]$TimestampByScene,
+    [string]$VideoDir,
+    [string]$VoicePath,
+    [string]$WorkDir,
+    [string]$Output,
+    [int]$Fps,
+    [double]$MotionSpeed,
+    [bool]$Youtube1080p
+) {
+    $inputs = @()
+    $filters = @()
+    $previousEndFrame = 0
+    $frameRows = @("scene,type,frames")
+    $motionCount = 0
+
+    for ($index = 0; $index -lt $Scenes.Count; $index++) {
+        $scene = $Scenes[$index]
+        $sceneNumber = [int]$scene.Scene
+        $videoPath = Join-Path $VideoDir "scene_$sceneNumber.mp4"
+        if (-not (Test-Path -LiteralPath $videoPath)) { throw "Scene video not found: $videoPath" }
+        $timestamp = $TimestampByScene[$sceneNumber]
+        if (-not $timestamp) { throw "Timestamp not found for scene_$sceneNumber." }
+        $endSeconds = $timestamp.Start + $timestamp.Duration
+        $endFrame = [int][Math]::Floor(($endSeconds * $Fps) + 0.5)
+        $frames = $endFrame - $previousEndFrame
+        if ($frames -lt 1) { throw "Scene $sceneNumber has invalid frame count: $frames" }
+        $previousEndFrame = $endFrame
+        $frameRows += "$sceneNumber,$($scene.Type),$frames"
+        $inputs += @("-i", $videoPath)
+
+        $chain = "[$index`:v]scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,setpts=PTS-STARTPTS,"
+        if ($scene.Type -eq "Motion" -and $MotionSpeed -ne 1.0) {
+            $motionCount++
+            $speedText = $MotionSpeed.ToString("0.###", [Globalization.CultureInfo]::InvariantCulture)
+            $chain += "setpts=PTS/$speedText,"
+        }
+        $chain += "fps=$Fps,tpad=stop_mode=clone:stop=-1,trim=end_frame=$frames,setpts=N/($Fps*TB)[v$index]"
+        $filters += $chain
+    }
+
+    $concatInputs = (0..($Scenes.Count - 1) | ForEach-Object { "[v$_]" }) -join ""
+    $filters += ("$concatInputs" + "concat=n=$($Scenes.Count):v=1:a=0[outv]")
+    New-Item -ItemType Directory -Path $WorkDir -Force | Out-Null
+    $label = if ($Youtube1080p) { "youtube-motion-0.6x" } else { "final" }
+    $filterPath = Join-Path $WorkDir "assemble-$label-filter.txt"
+    $countsPath = Join-Path $WorkDir "assemble-$label-frame-counts.csv"
+    Set-Content -LiteralPath $filterPath -Value ($filters -join ";") -Encoding ASCII
+    Set-Content -LiteralPath $countsPath -Value $frameRows -Encoding UTF8
+
+    $totalFrames = 0
+    foreach ($row in $frameRows | Select-Object -Skip 1) {
+        $totalFrames += [int](($row -split ",")[-1])
+    }
+    $duration = ($totalFrames / $Fps).ToString("0.000000", [Globalization.CultureInfo]::InvariantCulture)
+    if ($Youtube1080p) {
+        $videoArgs = @("-c:v", "libx264", "-preset", "medium", "-b:v", "10M", "-maxrate", "12M", "-bufsize", "20M")
+        $audioArgs = @("-c:a", "aac", "-b:a", "384k")
+    } else {
+        $videoArgs = @("-c:v", "libx264", "-preset", "medium", "-crf", "18")
+        $audioArgs = @("-c:a", "aac", "-b:a", "192k")
+    }
+
+    $ffmpegArgs = @("-nostdin", "-y") + $inputs + @(
+        "-i", $VoicePath,
+        "-filter_complex_script", $filterPath,
+        "-map", "[outv]",
+        "-map", "$($Scenes.Count):a:0"
+    ) + $videoArgs + @(
+        "-r", "$Fps",
+        "-pix_fmt", "yuv420p"
+    ) + $audioArgs + @(
+        "-t", $duration,
+        "-movflags", "+faststart",
+        $Output
+    )
+    Run-Ffmpeg $ffmpegArgs "Final assembly failed: $Output"
+    Write-Host "Created $Output with $totalFrames frames ($duration seconds). Motion slowed: $motionCount"
 }
 
 $storyboardPath = Resolve-PathValue $Storyboard
@@ -295,5 +391,31 @@ if (-not $SkipLipsyncCheck) {
     foreach ($scene in $scenes | Where-Object Type -eq "Avatar/Split-screen") {
         Copy-Item (Join-Path $videoDir "scene_$($scene.Scene)_1.mp4") $avatarVideoDir -Force
     }
-    Write-Host "Run check-lipsync.py against $avatarVideoDir before final assembly."
+    Write-Host "Avatar clips copied to $avatarVideoDir for optional lipsync validation."
+}
+
+if (-not $SkipAssemble) {
+    Invoke-FinalAssembly `
+        -Scenes $scenes `
+        -TimestampByScene $timestampByScene `
+        -VideoDir $videoDir `
+        -VoicePath $voicePath `
+        -WorkDir $workDir `
+        -Output (Join-Path $outputPath "final_video.mp4") `
+        -Fps 24 `
+        -MotionSpeed 1.0 `
+        -Youtube1080p $false
+}
+
+if (-not $SkipYoutubeAssemble) {
+    Invoke-FinalAssembly `
+        -Scenes $scenes `
+        -TimestampByScene $timestampByScene `
+        -VideoDir $videoDir `
+        -VoicePath $voicePath `
+        -WorkDir $workDir `
+        -Output (Join-Path $outputPath "final_video_motion_0_6x_youtube1080_corrected.mp4") `
+        -Fps 24 `
+        -MotionSpeed $YoutubeMotionSpeed `
+        -Youtube1080p $true
 }

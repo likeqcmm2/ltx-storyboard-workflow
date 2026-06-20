@@ -84,7 +84,8 @@ of truth is `Resources/output_scenes/scene_N.png`, including
 
 - FFmpeg available as `ffmpeg` in PATH for the lipsync checker
 
-The Linux generation scripts use the local LTX backend and system FFmpeg.
+The Linux generation scripts use the local LTX backend and system FFmpeg. The
+Windows PowerShell workflow uses the bundled Python and FFmpeg from LTX Desktop.
 
 ## Configuration
 
@@ -121,6 +122,32 @@ python3 ltx_linux_workflow.py \
 
 Existing files are skipped. Add `--force` only when intentionally regenerating
 existing media.
+
+On Windows, run the PowerShell workflow with your local resource paths:
+
+```powershell
+.\run-production-workflow.ps1 `
+  -Storyboard "C:\path\to\storyboard_elias_yoder.xlsx" `
+  -Timestamps "C:\path\to\time_stamp.csv" `
+  -VoiceOver "C:\path\to\voice_over.mp3" `
+  -AvatarImage "C:\path\to\avatar.png" `
+  -AvatarPrompt "C:\path\to\Prompt_for_avatar.txt" `
+  -OutputDir ".\output" `
+  -FirstScene 1 `
+  -LastScene 371
+```
+
+The Windows workflow starts its own local LTX backend, creates all scene media,
+applies the avatar lipsync workaround, builds split-screens, and then assembles
+both final MP4 files:
+
+```text
+output/final_video.mp4
+output/final_video_motion_0_6x_youtube1080_corrected.mp4
+```
+
+Use `-SkipAssemble` or `-SkipYoutubeAssemble` only when you intentionally want
+to skip one of those final exports.
 
 To regenerate avatar outputs with the stable-camera prompt, delete old avatar
 outputs and rewrite `Prompt_for_avatar.txt`:
@@ -165,6 +192,7 @@ output/
   work/
     avatar-videos-with-leadin/
   final_video.mp4
+  final_video_motion_0_6x_youtube1080_corrected.mp4
 ```
 
 ## Frame-Accurate Assembly
