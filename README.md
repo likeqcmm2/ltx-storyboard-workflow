@@ -72,6 +72,12 @@ of truth is `Resources/output_scenes/scene_N.png`, including
 ## Requirements
 
 - Linux for the RTX production path, or Windows/PowerShell for the legacy path
+- Git for Windows if you plan to clone, commit, or push this workflow:
+
+  ```powershell
+  winget install --id Git.Git -e --source winget
+  ```
+
 - LTX Desktop installed in `C:\Program Files\LTX Desktop`
 - LTX Desktop opened once so its bundled Python exists
 - Downloaded LTX 2.3 distilled models
@@ -84,8 +90,10 @@ of truth is `Resources/output_scenes/scene_N.png`, including
 
 - FFmpeg available as `ffmpeg` in PATH for the lipsync checker
 
-The Linux generation scripts use the local LTX backend and system FFmpeg. The
-Windows PowerShell workflow uses the bundled Python and FFmpeg from LTX Desktop.
+The Linux generation scripts use the local LTX backend and system FFmpeg by
+default. On Windows, use the provided PowerShell wrappers or set `FFMPEG` to the
+bundled LTX Desktop FFmpeg executable. `ltx_linux_workflow.py` can now read
+duration through `FFPROBE` when available, or through `FFMPEG -i` as a fallback.
 
 ## Configuration
 
@@ -94,6 +102,22 @@ Copy-Item .\config.example.json .\config.json
 ```
 
 Update all input paths and the desired scene range.
+
+Before a long run, validate that the storyboard, timestamps, voice-over, avatar
+assets, and required `output_scenes/scene_N.png` files are present:
+
+```bash
+python3 validate_resources.py --resources /root/Resources --first-scene 1 --last-scene 371
+```
+
+On Windows without a system Python, use LTX Desktop's bundled Python:
+
+```powershell
+& "$env:LOCALAPPDATA\LTXDesktop\python\python.exe" .\validate_resources.py `
+  --resources "C:\Users\you\Desktop\Resources" `
+  --first-scene 1 `
+  --last-scene 435
+```
 
 ## Run
 
@@ -122,6 +146,22 @@ python3 ltx_linux_workflow.py \
 
 Existing files are skipped. Add `--force` only when intentionally regenerating
 existing media.
+
+On Windows, if your scene images are already in `Resources\output_scenes` and
+you want the same pre-generated-image production path, use:
+
+```powershell
+.\run-pregenerated-windows.ps1 `
+  -Resources "C:\Users\you\Desktop\Resources" `
+  -FirstScene 1 `
+  -LastScene 435 `
+  -Youtube1080p
+```
+
+This wrapper starts/stops the local LTX backend, uses LTX Desktop's bundled
+Python and FFmpeg, redirects FFmpeg's stderr progress output into
+`production_output\work\runner\workflow.log`, and avoids relying on `ffmpeg` or
+`ffprobe` being in `PATH`.
 
 On Windows, run the PowerShell workflow with your local resource paths:
 
@@ -174,6 +214,21 @@ python3 assemble_motion_slow_youtube.py \
   --resources /root/Resources \
   --production-output /root/Resources/production_output \
   --output /root/Resources/production_output/final_video_motion_0_6x_youtube1080_corrected.mp4 \
+  --motion-speed 0.6
+```
+
+If final assembly on Windows fails with `WinError 206` or "filename or
+extension is too long", use the chunked assembler. It renders short video-only
+chunks first, then concatenates those chunks with the original voice-over:
+
+```powershell
+$env:FFMPEG = & "$env:LOCALAPPDATA\LTXDesktop\python\python.exe" -c "import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())"
+& "$env:LOCALAPPDATA\LTXDesktop\python\python.exe" .\assemble_chunked_windows.py `
+  --resources "C:\Users\you\Desktop\Resources" `
+  --production-output "C:\Users\you\Desktop\Resources\production_output" `
+  --output "C:\Users\you\Desktop\Resources\production_output\final_video_motion_0_6x_youtube1080_corrected.mp4" `
+  --first-scene 1 `
+  --last-scene 435 `
   --motion-speed 0.6
 ```
 
@@ -232,4 +287,8 @@ The corrected final uses:
 
 - The scripts start and stop their own local LTX backend.
 - Generation can take substantial time; outputs are resumable.
+- Avatar audio sent to LTX is forced to stereo (`-ac 2`) because the local
+  avatar model can fail when handed mono audio.
+- Avatar lead-in is reduced automatically for long avatar scenes so the audio
+  submitted to LTX stays inside its short request window.
 - Do not commit generated media, models, API keys, voice-over, or storyboards.

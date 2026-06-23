@@ -16,8 +16,16 @@ def run(cmd, msg=None):
         raise RuntimeError(msg or f'Command failed: {cmd}')
 
 def ffprobe_duration(path: Path) -> float:
-    out = subprocess.check_output(['ffprobe','-v','error','-show_entries','format=duration','-of','default=nk=1:nw=1',str(path)], text=True).strip()
-    return float(out)
+    ffprobe = os.environ.get('FFPROBE')
+    if ffprobe:
+        out = subprocess.check_output([ffprobe,'-v','error','-show_entries','format=duration','-of','default=nk=1:nw=1',str(path)], text=True).strip()
+        return float(out)
+    ffmpeg = os.environ.get('FFMPEG', 'ffmpeg')
+    p = subprocess.run([ffmpeg, '-hide_banner', '-i', str(path)], capture_output=True, text=True)
+    m = re.search(r'Duration:\s+(\d+):(\d+):(\d+(?:\.\d+)?)', p.stderr + p.stdout)
+    if not m:
+        raise RuntimeError(f'Could not determine duration for {path}')
+    return int(m.group(1))*3600 + int(m.group(2))*60 + float(m.group(3))
 
 def timecode_seconds(s: str) -> float:
     m = re.match(r'^(\d{1,2}):(\d{1,2}):(\d{1,2})(?:\.(\d{1,3}))?$', s.strip())
@@ -108,11 +116,11 @@ def prepare_ltx_avatar_audio(ffmpeg: str, src: Path, dst: Path, lead_in: float, 
         '-f','lavfi','-t',f'{lead_in:.3f}','-i','anullsrc=r=44100:cl=stereo',
         '-i',str(src),
         '-filter_complex','[0:a][1:a]concat=n=2:v=0:a=1[a]',
-        '-map','[a]','-codec:a','libmp3lame','-q:a','0',str(padded),
+        '-map','[a]','-ac','2','-codec:a','libmp3lame','-q:a','0',str(padded),
     ], f'Add avatar lead-in failed {dst}')
     run([
         ffmpeg,'-nostdin','-y','-i',str(padded),'-filter:a',f'volume={gain_db:g}dB',
-        '-q:a','0',str(dst),
+        '-ac','2','-q:a','0',str(dst),
     ], f'Boost avatar audio failed {dst}')
     padded.unlink(missing_ok=True)
 
@@ -124,6 +132,13 @@ def trim_avatar_leadin(ffmpeg: str, src: Path, dst: Path, lead_in: float, durati
         '-vf','scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,format=yuv420p',
         '-c:a','aac','-b:a','192k','-movflags','+faststart',str(dst),
     ], f'Trim avatar lead-in failed {dst}')
+
+def avatar_lead_in_for_duration(duration: float, requested: float) -> float:
+    # LTX Desktop rejects avatar requests above its short audio window. Keep
+    # the audio comfortably below 6s while preserving as much lead-in as possible.
+    if duration + requested <= 5.9:
+        return requested
+    return max(0.25, 5.9 - duration)
 
 def copy_scene_images(scenes, source_dir: Path, image_dir: Path):
     image_dir.mkdir(parents=True, exist_ok=True)
@@ -220,7 +235,7 @@ def main():
     scenes=read_storyboard(storyboard,args.first_scene,args.last_scene)
     timestamps=read_timestamps(timestamps_path,args.first_scene,args.last_scene)
     copy_scene_images(scenes, res/'output_scenes', image_dir)
-    ffmpeg='ffmpeg'
+    ffmpeg=os.environ.get('FFMPEG', 'ffmpeg')
     wait_backend(args.base_url)
     fps=24
     # Motion: image-to-video, silent.
@@ -241,19 +256,20 @@ def main():
             aud=audio_dir/f'scene_{n}.mp3'
             if args.force or not aud.exists():
                 run([ffmpeg,'-nostdin','-y','-ss',f"{ts['start']:.3f}",'-t',f"{ts['duration']:.3f}",'-i',str(voice),'-vn','-codec:a','libmp3lame','-q:a','2',str(aud)], f'Audio cut failed {n}')
+            dur=ffprobe_duration(aud)
+            avatar_lead_in = avatar_lead_in_for_duration(dur, args.avatar_lead_in_seconds)
             ltx_aud=ltx_audio_dir/f'scene_{n}.mp3'
             if args.force or not ltx_aud.exists():
-                prepare_ltx_avatar_audio(ffmpeg, aud, ltx_aud, args.avatar_lead_in_seconds, args.avatar_audio_gain_db)
+                prepare_ltx_avatar_audio(ffmpeg, aud, ltx_aud, avatar_lead_in, args.avatar_audio_gain_db)
             dst=video_dir/(f'scene_{n}_1.mp4' if sc['type']=='Avatar/Split-screen' else f'scene_{n}.mp4')
             if dst.exists() and not args.force: print(f'SKIP AVATAR {n}', flush=True); continue
-            dur=ffprobe_duration(aud)
-            gen_dur=max(6, int((dur + args.avatar_lead_in_seconds) + 0.999))
+            gen_dur=max(6, int((dur + avatar_lead_in) + 0.999))
             avatar_resolution = '720p' if gen_dur > 5 else '1080p'
             raw_dst=raw_avatar_dir/(f'scene_{n}_1.mp4' if sc['type']=='Avatar/Split-screen' else f'scene_{n}.mp4')
-            print(f'AVATAR {n} audio={dur:.3f}s ltx_audio={dur + args.avatar_lead_in_seconds:.3f}s generation_duration={gen_dur}s resolution={avatar_resolution}->1080p', flush=True)
+            print(f'AVATAR {n} audio={dur:.3f}s lead_in={avatar_lead_in:.3f}s ltx_audio={dur + avatar_lead_in:.3f}s generation_duration={gen_dur}s resolution={avatar_resolution}->1080p', flush=True)
             r=api_post(args.base_url,'/api/generate',{'prompt': avatar_prompt,'resolution':avatar_resolution,'model':'fast','cameraMotion':'none','negativePrompt':'','duration':gen_dur,'fps':fps,'audio':True,'imagePath':str(avatar_img),'audioPath':str(ltx_aud),'aspectRatio':'16:9'})
             shutil.copy2(r['video_path'], raw_dst)
-            trim_avatar_leadin(ffmpeg, raw_dst, dst, args.avatar_lead_in_seconds, dur)
+            trim_avatar_leadin(ffmpeg, raw_dst, dst, avatar_lead_in, dur)
             if sc['type']=='Avatar': shutil.copy2(dst, avatar_video_dir/dst.name)
             else: shutil.copy2(dst, avatar_video_dir/dst.name)
     # KenBurn clips: standalone and right side for split-screen.
